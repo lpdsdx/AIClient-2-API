@@ -908,6 +908,12 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
     processedRequestBody = await _applySystemPromptFromFile(CONFIG, processedRequestBody, toProvider);
     await _manageSystemPrompt(processedRequestBody, toProvider);
 
+    // 3.5 Inject default thinking config if not provided by client (for Kiro provider)
+    if (toProvider && toProvider.includes('kiro') && !processedRequestBody.thinking) {
+        processedRequestBody.thinking = { type: 'enabled', budget_tokens: 20000 };
+        logger.info('[Default Thinking] Injected default thinking config: enabled, budget_tokens=20000');
+    }
+
     // 4. Log the incoming prompt (after potential conversion to the backend's format).
     const promptText = extractPromptText(processedRequestBody, toProvider);
     await logConversation('input', promptText, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME);

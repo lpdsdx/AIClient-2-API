@@ -1284,6 +1284,34 @@ async saveCredentialsToFile(filePath, newData) {
             }
         }
 
+        // === Context Auto-Trimming: 防止 CONTENT_LENGTH_EXCEEDS_THRESHOLD ===
+        const MAX_HISTORY_CHARS = 500000; // ~125k tokens, 留余量给 tools/currentMessage
+        const estimateSize = (obj) => {
+            try { return JSON.stringify(obj).length; } catch { return 0; }
+        };
+        if (history.length > 2) {
+            let totalSize = estimateSize(history);
+            const toolsSize = estimateSize(toolsContext);
+            const currentSize = estimateSize(currentContent) + estimateSize(currentToolResults);
+            const overhead = toolsSize + currentSize;
+            const effectiveLimit = MAX_HISTORY_CHARS - Math.min(overhead, 100000);
+            
+            if (totalSize > effectiveLimit) {
+                const originalCount = history.length;
+                // 保留第一条(含system prompt)和最后几条(最近上下文)
+                // 从第二条开始删除，每次删2条(一对user+assistant)
+                while (history.length > 4 && totalSize > effectiveLimit) {
+                    // 删除 index 1 和 2 (第一对历史对话，保留 index 0 的 system prompt)
+                    const removed1 = history.splice(1, 1)[0];
+                    const removed2 = history.length > 1 ? history.splice(1, 1)[0] : null;
+                    totalSize -= estimateSize(removed1);
+                    if (removed2) totalSize -= estimateSize(removed2);
+                }
+                logger.info(`[Kiro] [Context Trimming] Trimmed history from ${originalCount} to ${history.length} entries (size: ${totalSize} chars, limit: ${effectiveLimit} chars, tools overhead: ${toolsSize} chars)`);
+            }
+        }
+        // === End Context Auto-Trimming ===
+
         const request = {
             conversationState: {
                 chatTriggerType: KIRO_CONSTANTS.CHAT_TRIGGER_TYPE_MANUAL,
@@ -1584,6 +1612,7 @@ async saveCredentialsToFile(filePath, newData) {
             }
 
             logger.error(`[Kiro] API call failed (Status: ${status}, Code: ${errorCode}):`, error.message);
+            if (error.response?.data) { try { const errBody = Buffer.isBuffer(error.response.data) ? error.response.data.toString("utf8") : JSON.stringify(error.response.data); logger.error(`[Kiro] Upstream error response body:`, errBody); } catch(e) { logger.error(`[Kiro] Upstream error response body (raw):`, error.response.data); } }
             throw error;
         }
     }
@@ -2116,7 +2145,8 @@ async saveCredentialsToFile(filePath, newData) {
                 return;
             }
 
-            logger.error(`[Kiro] Stream API call failed (Status: ${status}, Code: ${errorCode}):`,  error.message);
+            logger.error(`[Kiro] Stream API call failed (Status: ${status}, Code: ${errorCode}):`, error.message);
+            if (error.response?.data) { try { const errBody = Buffer.isBuffer(error.response.data) ? error.response.data.toString("utf8") : JSON.stringify(error.response.data); logger.error(`[Kiro] Upstream stream error response body:`, errBody); } catch(e) { logger.error(`[Kiro] Upstream stream error response body (raw):`, error.response.data); } }
             throw error;
         } finally {
             // 确保流被关闭，释放资源
@@ -2806,12 +2836,6 @@ async saveCredentialsToFile(filePath, newData) {
                     outputTokens += this.countTextTokens(tc.function.arguments);
                 }
                 stopReason = "tool_use"; // Set stop_reason to "tool_use" when toolCalls exist
-            } else if (content) {
-                contentArray.push({
-                    type: "text",
-                    text: content
-                });
-                outputTokens += this.countTextTokens(content);
             }
 
             return {
