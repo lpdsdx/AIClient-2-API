@@ -771,8 +771,8 @@ export class ClaudeConverter extends BaseConverter {
             }
         });
         
-        return contentArray.length === 1 && contentArray[0].type === 'text'
-            ? contentArray[0].text
+        return contentArray.every(item => item.type === 'text')
+            ? contentArray.map(item => item.text).join('')
             : contentArray;
     }
 
