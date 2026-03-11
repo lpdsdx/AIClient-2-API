@@ -85,11 +85,10 @@ function generateMachineIdFromConfig(credentials) {
  * @returns {Object} 包含 osName, nodeVersion 等信息
  */
 function getSystemRuntimeInfo() {
-    const nodeVersion = process.version.replace('v', '');
-
-    // 始终伪装为 macOS 系统，使用常见的 macOS 版本号
-    // 24.0.0 对应 macOS 15 (Sequoia)
+    // 始终伪装为 macOS + Kiro IDE 内嵌的 Electron Node.js 版本
+    // Kiro IDE 基于 Electron，内嵌 Node.js 版本通常为 20.x
     const osName = 'macos#24.0.0';
+    const nodeVersion = '20.18.1';
 
     return {
         osName,
@@ -421,6 +420,12 @@ export class KiroApiService {
         this.modelName = KIRO_CONSTANTS.DEFAULT_MODEL_NAME;
         this.axiosInstance = null; // Initialize later in async method
         this.axiosSocialRefreshInstance = null;
+
+        // conversationId 自动维护：基于消息历史的 hash 自动关联同一对话
+        // key: 前几条消息的 hash, value: { conversationId, lastUsed }
+        this.conversationIdCache = new Map();
+        this.conversationIdCacheMaxSize = 100;
+        this.conversationIdCacheTTL = 30 * 60 * 1000; // 30 分钟过期
     }
  
     async initialize() {
@@ -430,12 +435,13 @@ export class KiroApiService {
         // 仅执行基础的凭证加载
         await this.loadCredentials();
         
-        // 根据当前加载的凭证生成唯一的 Machine ID
-        const machineId = generateMachineIdFromConfig({
+        // 根据当前加载的凭证生成唯一的 Machine ID（初始化后固定不变）
+        this.machineId = generateMachineIdFromConfig({
             uuid: this.uuid,
             profileArn: this.profileArn,
             clientId: this.clientId
         });
+        const machineId = this.machineId;
         const kiroVersion = KIRO_CONSTANTS.KIRO_VERSION;
         const { osName, nodeVersion } = getSystemRuntimeInfo();
 
@@ -477,9 +483,14 @@ export class KiroApiService {
         
         this.axiosInstance = axios.create(axiosConfig);
 
-        axiosConfig.headers = new Headers();
-        axiosConfig.headers.set('Content-Type', KIRO_CONSTANTS.CONTENT_TYPE_JSON);
-        this.axiosSocialRefreshInstance = axios.create(axiosConfig);
+        // Social refresh 实例：只需要 Content-Type，但保留 User-Agent 伪装
+        const socialRefreshConfig = { ...axiosConfig };
+        socialRefreshConfig.headers = {
+            'Content-Type': KIRO_CONSTANTS.CONTENT_TYPE_JSON,
+            'user-agent': axiosConfig.headers['user-agent'],
+            'x-amz-user-agent': axiosConfig.headers['x-amz-user-agent']
+        };
+        this.axiosSocialRefreshInstance = axios.create(socialRefreshConfig);
         this.isInitialized = true;
     }
 
@@ -853,9 +864,11 @@ async saveCredentialsToFile(filePath, newData) {
      * Build CodeWhisperer request from OpenAI messages
      */
     async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null, conversationId = null) {
-        // 如果客户端传入了 conversationId，使用它；否则生成新的
-        // 这样可以让客户端维护会话连续性，模拟真实 IDE 的多轮对话行为
-        const actualConversationId = conversationId || uuidv4();
+        // conversationId 自动维护：
+        // 1. 客户端显式传入 → 直接使用
+        // 2. 未传入 → 基于前几条消息的 hash 自动关联同一对话
+        // 3. 全新对话 → 生成新的 conversationId 并缓存
+        const actualConversationId = conversationId || this._resolveConversationId(messages);
         
         // 内置的 systemPrompt 前缀
         const builtInPrefix = `<CRITICAL_OVERRIDE>
@@ -1629,6 +1642,49 @@ async saveCredentialsToFile(filePath, newData) {
             if (error.response?.data) { try { const errBody = Buffer.isBuffer(error.response.data) ? error.response.data.toString("utf8") : JSON.stringify(error.response.data); logger.error(`[Kiro] Upstream error response body:`, errBody); } catch(e) { logger.error(`[Kiro] Upstream error response body (raw):`, error.response.data); } }
             throw error;
         }
+    }
+
+    /**
+     * 基于消息历史自动解析 conversationId
+     * 通过对前几条消息做 hash，判断是否属于同一对话的延续
+     * @private
+     */
+    _resolveConversationId(messages) {
+        // 清理过期缓存
+        const now = Date.now();
+        for (const [key, entry] of this.conversationIdCache) {
+            if (now - entry.lastUsed > this.conversationIdCacheTTL) {
+                this.conversationIdCache.delete(key);
+            }
+        }
+
+        // 取前 2 条消息的内容做 hash（通常是 system + 第一条 user 消息）
+        // 同一对话的延续请求，这些消息是不变的
+        const hashSource = messages.slice(0, 2).map(m => {
+            const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+            return `${m.role}:${content.substring(0, 200)}`;
+        }).join('|');
+        const hash = crypto.createHash('md5').update(hashSource).digest('hex');
+
+        const cached = this.conversationIdCache.get(hash);
+        if (cached) {
+            cached.lastUsed = now;
+            logger.debug(`[Kiro] Reusing conversationId ${cached.conversationId} for existing conversation`);
+            return cached.conversationId;
+        }
+
+        // 新对话，生成新的 conversationId
+        const newId = uuidv4();
+        this.conversationIdCache.set(hash, { conversationId: newId, lastUsed: now });
+
+        // 超过最大缓存数量时，删除最旧的
+        if (this.conversationIdCache.size > this.conversationIdCacheMaxSize) {
+            const oldestKey = this.conversationIdCache.keys().next().value;
+            this.conversationIdCache.delete(oldestKey);
+        }
+
+        logger.debug(`[Kiro] Created new conversationId ${newId} for new conversation`);
+        return newId;
     }
 
     /**
@@ -3022,12 +3078,8 @@ async saveCredentialsToFile(filePath, newData) {
         }
         const fullUrl = `${usageLimitsUrl}?${params.toString()}`;
 
-        // 动态生成 headers
-        const machineId = generateMachineIdFromConfig({
-            uuid: this.uuid,
-            profileArn: this.profileArn,
-            clientId: this.clientId
-        });
+        // 使用初始化时固定的 machineId，保持一致性
+        const machineId = this.machineId;
         const kiroVersion = KIRO_CONSTANTS.KIRO_VERSION;
         const { osName, nodeVersion } = getSystemRuntimeInfo();
 
