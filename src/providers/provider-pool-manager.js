@@ -112,8 +112,13 @@ export class ProviderPoolManager {
 
                 if (configPath && fs.existsSync(configPath)) {
                     try {
-                        if (true) {
-                            this._log('warn', `Node ${providerStatus.uuid} (${providerType}) is near expiration. Enqueuing refresh...`);
+                        const fileContent = fs.readFileSync(configPath, 'utf8');
+                        const creds = JSON.parse(fileContent);
+                        const expiresAt = creds.expiresAt ? new Date(creds.expiresAt).getTime() : 0;
+                        const now = Date.now();
+                        const nearThresholdMs = 30 * 60 * 1000; // 30 分钟
+                        if (expiresAt > 0 && (expiresAt - now) < nearThresholdMs) {
+                            this._log('warn', `Node ${providerStatus.uuid} (${providerType}) is near expiration (expires: ${new Date(expiresAt).toISOString()}). Enqueuing refresh...`);
                             this._enqueueRefresh(providerType, providerStatus);
                         }
                     } catch (err) {

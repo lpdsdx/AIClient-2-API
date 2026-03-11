@@ -80,15 +80,22 @@ function generateMachineIdFromConfig(credentials) {
 }
 
 /**
- * 实时获取系统配置信息，用于生成 User-Agent
- * 为了降低封号风险，始终伪装为 macOS 系统
+ * 基于 machineId 生成差异化但稳定的系统指纹
+ * 每个账号/实例的 OS 小版本和 Node patch 版本不同，避免聚类识别
+ * @param {string} machineId - 当前实例的 machineId
  * @returns {Object} 包含 osName, nodeVersion 等信息
  */
-function getSystemRuntimeInfo() {
-    // 始终伪装为 macOS + Kiro IDE 内嵌的 Electron Node.js 版本
-    // Kiro IDE 基于 Electron，内嵌 Node.js 版本通常为 20.x
-    const osName = 'macos#24.0.0';
-    const nodeVersion = '20.18.1';
+function getSystemRuntimeInfo(machineId) {
+    // 用 machineId 的前几个字符生成稳定的差异化数值
+    const seed = machineId ? parseInt(machineId.substring(0, 8), 16) : 0;
+
+    // macOS 内核版本：24.x.0（macOS 15 Sequoia 范围内的合理变体）
+    const osMinor = seed % 6; // 0-5
+    const osName = `macos#24.${osMinor}.0`;
+
+    // Node.js 版本：Kiro IDE Electron 内嵌的 20.x 系列
+    const nodePatch = seed % 12; // 0-11
+    const nodeVersion = `20.18.${nodePatch}`;
 
     return {
         osName,
@@ -392,6 +399,7 @@ export class KiroApiService {
         // 请求间隔限制（防止请求过于频繁被检测为异常）
         this.lastRequestTime = 0;
         this.minRequestInterval = config.KIRO_MIN_REQUEST_INTERVAL || 1000; // 默认 1 秒间隔
+        this._rateLimitQueue = Promise.resolve(); // 互斥锁：串行化请求间隔检查
 
         // this.accessToken = config.KIRO_ACCESS_TOKEN;
         // this.refreshToken = config.KIRO_REFRESH_TOKEN;
@@ -420,12 +428,6 @@ export class KiroApiService {
         this.modelName = KIRO_CONSTANTS.DEFAULT_MODEL_NAME;
         this.axiosInstance = null; // Initialize later in async method
         this.axiosSocialRefreshInstance = null;
-
-        // conversationId 自动维护：基于消息历史的 hash 自动关联同一对话
-        // key: 前几条消息的 hash, value: { conversationId, lastUsed }
-        this.conversationIdCache = new Map();
-        this.conversationIdCacheMaxSize = 100;
-        this.conversationIdCacheTTL = 30 * 60 * 1000; // 30 分钟过期
     }
  
     async initialize() {
@@ -443,7 +445,7 @@ export class KiroApiService {
         });
         const machineId = this.machineId;
         const kiroVersion = KIRO_CONSTANTS.KIRO_VERSION;
-        const { osName, nodeVersion } = getSystemRuntimeInfo();
+        const { osName, nodeVersion } = getSystemRuntimeInfo(machineId);
 
         // 配置 HTTP/HTTPS agent 限制连接池大小，避免资源泄漏
         const httpAgent = new http.Agent({
@@ -560,15 +562,21 @@ async loadCredentials() {
                 logger.info(`[Kiro Auth] Successfully loaded OAuth credentials from ${targetFilePath}`);
             }
 
-            const files = await fs.readdir(dirPath);
-            for (const file of files) {
-                if (file.endsWith('.json') && file !== targetFileName) {
-                    const filePath = path.join(dirPath, file);
-                    const credentials = await loadCredentialsFromFile(filePath);
-                    if (credentials) {
-                        credentials.expiresAt = mergedCredentials.expiresAt;
-                        Object.assign(mergedCredentials, credentials);
-                        logger.debug(`[Kiro Auth] Loaded Client credentials from ${file}`);
+            // 仅当目标文件缺少 clientId/clientSecret 时，才从同目录补充
+            // 避免把不相关的 JSON 文件字段混入当前凭证
+            if (!mergedCredentials.clientId || !mergedCredentials.clientSecret) {
+                const files = await fs.readdir(dirPath);
+                for (const file of files) {
+                    if (file.endsWith('.json') && file !== targetFileName) {
+                        const filePath = path.join(dirPath, file);
+                        const credentials = await loadCredentialsFromFile(filePath);
+                        if (credentials?.clientId && credentials?.clientSecret) {
+                            // 只提取缺失的 clientId/clientSecret，不合并其他字段
+                            if (!mergedCredentials.clientId) mergedCredentials.clientId = credentials.clientId;
+                            if (!mergedCredentials.clientSecret) mergedCredentials.clientSecret = credentials.clientSecret;
+                            logger.debug(`[Kiro Auth] Supplemented clientId/clientSecret from ${file}`);
+                            break; // 找到就停，不继续遍历
+                        }
                     }
                 }
             }
@@ -864,11 +872,8 @@ async saveCredentialsToFile(filePath, newData) {
      * Build CodeWhisperer request from OpenAI messages
      */
     async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null, conversationId = null) {
-        // conversationId 自动维护：
-        // 1. 客户端显式传入 → 直接使用
-        // 2. 未传入 → 基于前几条消息的 hash 自动关联同一对话
-        // 3. 全新对话 → 生成新的 conversationId 并缓存
-        const actualConversationId = conversationId || this._resolveConversationId(messages);
+        // conversationId：仅接受客户端显式传入，不传则每次新建
+        const actualConversationId = conversationId || uuidv4();
         
         // 内置的 systemPrompt 前缀
         const builtInPrefix = `<CRITICAL_OVERRIDE>
@@ -1513,15 +1518,8 @@ async saveCredentialsToFile(filePath, newData) {
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000; // 1 second base delay
 
-        // 请求间隔限制：模拟真实用户的请求节奏
-        const now = Date.now();
-        const timeSinceLastRequest = now - this.lastRequestTime;
-        if (timeSinceLastRequest < this.minRequestInterval) {
-            const waitTime = this.minRequestInterval - timeSinceLastRequest;
-            logger.debug(`[Kiro] Rate limiting: waiting ${waitTime}ms before next request`);
-            await new Promise(resolve => setTimeout(resolve, waitTime));
-        }
-        this.lastRequestTime = Date.now();
+        // 互斥限速：确保并发请求真正排队
+        await this._acquireRateLimit();
 
         // 处理不同格式的请求体（messages 或 contents）
         let messages = body.messages;
@@ -1645,46 +1643,24 @@ async saveCredentialsToFile(filePath, newData) {
     }
 
     /**
-     * 基于消息历史自动解析 conversationId
-     * 通过对前几条消息做 hash，判断是否属于同一对话的延续
+     * 互斥的请求限速：通过 Promise 链保证同一实例的请求串行排队
+     * 解决多个并发请求同时读取 lastRequestTime 导致限速失效的问题
      * @private
      */
-    _resolveConversationId(messages) {
-        // 清理过期缓存
-        const now = Date.now();
-        for (const [key, entry] of this.conversationIdCache) {
-            if (now - entry.lastUsed > this.conversationIdCacheTTL) {
-                this.conversationIdCache.delete(key);
+    async _acquireRateLimit() {
+        const ticket = this._rateLimitQueue.then(async () => {
+            const now = Date.now();
+            const elapsed = now - this.lastRequestTime;
+            if (elapsed < this.minRequestInterval) {
+                const waitTime = this.minRequestInterval - elapsed;
+                logger.debug(`[Kiro] Rate limiting: waiting ${waitTime}ms before next request`);
+                await new Promise(resolve => setTimeout(resolve, waitTime));
             }
-        }
-
-        // 取前 2 条消息的内容做 hash（通常是 system + 第一条 user 消息）
-        // 同一对话的延续请求，这些消息是不变的
-        const hashSource = messages.slice(0, 2).map(m => {
-            const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
-            return `${m.role}:${content.substring(0, 200)}`;
-        }).join('|');
-        const hash = crypto.createHash('md5').update(hashSource).digest('hex');
-
-        const cached = this.conversationIdCache.get(hash);
-        if (cached) {
-            cached.lastUsed = now;
-            logger.debug(`[Kiro] Reusing conversationId ${cached.conversationId} for existing conversation`);
-            return cached.conversationId;
-        }
-
-        // 新对话，生成新的 conversationId
-        const newId = uuidv4();
-        this.conversationIdCache.set(hash, { conversationId: newId, lastUsed: now });
-
-        // 超过最大缓存数量时，删除最旧的
-        if (this.conversationIdCache.size > this.conversationIdCacheMaxSize) {
-            const oldestKey = this.conversationIdCache.keys().next().value;
-            this.conversationIdCache.delete(oldestKey);
-        }
-
-        logger.debug(`[Kiro] Created new conversationId ${newId} for new conversation`);
-        return newId;
+            this.lastRequestTime = Date.now();
+        });
+        // 链式追加，后续请求排在当前之后
+        this._rateLimitQueue = ticket.catch(() => {});
+        return ticket;
     }
 
     /**
@@ -2059,15 +2035,8 @@ async saveCredentialsToFile(filePath, newData) {
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000;
 
-        // 请求间隔限制：模拟真实用户的请求节奏
-        const now = Date.now();
-        const timeSinceLastRequest = now - this.lastRequestTime;
-        if (timeSinceLastRequest < this.minRequestInterval) {
-            const waitTime = this.minRequestInterval - timeSinceLastRequest;
-            logger.debug(`[Kiro] Rate limiting: waiting ${waitTime}ms before next request`);
-            await new Promise(resolve => setTimeout(resolve, waitTime));
-        }
-        this.lastRequestTime = Date.now();
+        // 互斥限速：确保并发请求真正排队
+        await this._acquireRateLimit();
 
         // 处理不同格式的请求体（messages 或 contents）
         let messages = body.messages;
@@ -3081,7 +3050,7 @@ async saveCredentialsToFile(filePath, newData) {
         // 使用初始化时固定的 machineId，保持一致性
         const machineId = this.machineId;
         const kiroVersion = KIRO_CONSTANTS.KIRO_VERSION;
-        const { osName, nodeVersion } = getSystemRuntimeInfo();
+        const { osName, nodeVersion } = getSystemRuntimeInfo(machineId);
 
         const headers = {
             'Authorization': `Bearer ${this.accessToken}`,
