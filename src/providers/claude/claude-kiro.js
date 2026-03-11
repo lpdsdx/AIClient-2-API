@@ -32,7 +32,7 @@ const KIRO_CONSTANTS = {
     AXIOS_TIMEOUT: 120000, // 2 minutes timeout for normal requests
     TOKEN_REFRESH_TIMEOUT: 15000, // 15 seconds timeout for token refresh (shorter to avoid blocking)
     USER_AGENT: 'KiroIDE',
-    KIRO_VERSION: '0.8.140',
+    KIRO_VERSION: '0.8.160',
     CONTENT_TYPE_JSON: 'application/json',
     ACCEPT_JSON: 'application/json',
     AUTH_METHOD_SOCIAL: 'social',
@@ -81,17 +81,15 @@ function generateMachineIdFromConfig(credentials) {
 
 /**
  * 实时获取系统配置信息，用于生成 User-Agent
+ * 为了降低封号风险，始终伪装为 macOS 系统
  * @returns {Object} 包含 osName, nodeVersion 等信息
  */
 function getSystemRuntimeInfo() {
-    const osPlatform = os.platform();
-    const osRelease = os.release();
     const nodeVersion = process.version.replace('v', '');
-    
-    let osName = osPlatform;
-    if (osPlatform === 'win32') osName = `windows#${osRelease}`;
-    else if (osPlatform === 'darwin') osName = `macos#${osRelease}`;
-    else osName = `${osPlatform}#${osRelease}`;
+
+    // 始终伪装为 macOS 系统，使用常见的 macOS 版本号
+    // 24.0.0 对应 macOS 15 (Sequoia)
+    const osName = 'macos#24.0.0';
 
     return {
         osName,
@@ -391,6 +389,11 @@ export class KiroApiService {
         this.useSystemProxy = config?.USE_SYSTEM_PROXY_KIRO ?? false;
         this.uuid = config?.uuid; // 获取多节点配置的 uuid
         logger.info(`[Kiro] System proxy ${this.useSystemProxy ? 'enabled' : 'disabled'}`);
+
+        // 请求间隔限制（防止请求过于频繁被检测为异常）
+        this.lastRequestTime = 0;
+        this.minRequestInterval = config.KIRO_MIN_REQUEST_INTERVAL || 1000; // 默认 1 秒间隔
+
         // this.accessToken = config.KIRO_ACCESS_TOKEN;
         // this.refreshToken = config.KIRO_REFRESH_TOKEN;
         // this.clientId = config.KIRO_CLIENT_ID;
@@ -460,8 +463,7 @@ export class KiroApiService {
                 'amz-sdk-request': 'attempt=1; max=1',
                 'x-amzn-kiro-agent-mode': 'vibe',
                 'x-amz-user-agent': `aws-sdk-js/1.0.0 KiroIDE-${kiroVersion}-${machineId}`,
-                'user-agent': `aws-sdk-js/1.0.0 ua/2.1 os/${osName} lang/js md/nodejs#${nodeVersion} api/codewhispererruntime#1.0.0 m/E KiroIDE-${kiroVersion}-${machineId}`,
-                'Connection': 'close'
+                'user-agent': `aws-sdk-js/1.0.0 ua/2.1 os/${osName} lang/js md/nodejs#${nodeVersion} api/codewhispererruntime#1.0.0 m/E KiroIDE-${kiroVersion}-${machineId}`
             },
         };
         
@@ -850,8 +852,10 @@ async saveCredentialsToFile(filePath, newData) {
     /**
      * Build CodeWhisperer request from OpenAI messages
      */
-    async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null) {
-        const conversationId = uuidv4();
+    async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null, conversationId = null) {
+        // 如果客户端传入了 conversationId，使用它；否则生成新的
+        // 这样可以让客户端维护会话连续性，模拟真实 IDE 的多轮对话行为
+        const actualConversationId = conversationId || uuidv4();
         
         // 内置的 systemPrompt 前缀
         const builtInPrefix = `<CRITICAL_OVERRIDE>
@@ -1315,7 +1319,7 @@ async saveCredentialsToFile(filePath, newData) {
         const request = {
             conversationState: {
                 chatTriggerType: KIRO_CONSTANTS.CHAT_TRIGGER_TYPE_MANUAL,
-                conversationId: conversationId,
+                conversationId: actualConversationId,
                 currentMessage: {} // Will be populated as userInputMessage
             }
         };
@@ -1496,6 +1500,16 @@ async saveCredentialsToFile(filePath, newData) {
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000; // 1 second base delay
 
+        // 请求间隔限制：模拟真实用户的请求节奏
+        const now = Date.now();
+        const timeSinceLastRequest = now - this.lastRequestTime;
+        if (timeSinceLastRequest < this.minRequestInterval) {
+            const waitTime = this.minRequestInterval - timeSinceLastRequest;
+            logger.debug(`[Kiro] Rate limiting: waiting ${waitTime}ms before next request`);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+        }
+        this.lastRequestTime = Date.now();
+
         // 处理不同格式的请求体（messages 或 contents）
         let messages = body.messages;
         if (!messages && body.contents) {
@@ -1510,7 +1524,7 @@ async saveCredentialsToFile(filePath, newData) {
             throw new Error('No messages found in request body');
         }
 
-        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking);
+        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking, body.conversationId);
 
         try {
             const token = this.accessToken; // Use the already initialized token
@@ -1989,6 +2003,16 @@ async saveCredentialsToFile(filePath, newData) {
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000;
 
+        // 请求间隔限制：模拟真实用户的请求节奏
+        const now = Date.now();
+        const timeSinceLastRequest = now - this.lastRequestTime;
+        if (timeSinceLastRequest < this.minRequestInterval) {
+            const waitTime = this.minRequestInterval - timeSinceLastRequest;
+            logger.debug(`[Kiro] Rate limiting: waiting ${waitTime}ms before next request`);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+        }
+        this.lastRequestTime = Date.now();
+
         // 处理不同格式的请求体（messages 或 contents）
         let messages = body.messages;
         if (!messages && body.contents) {
@@ -2003,7 +2027,7 @@ async saveCredentialsToFile(filePath, newData) {
             throw new Error('No messages found in request body');
         }
 
-        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking);
+        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking, body.conversationId);
 
         const token = this.accessToken;
         const headers = {
@@ -3012,8 +3036,7 @@ async saveCredentialsToFile(filePath, newData) {
             'x-amz-user-agent': `aws-sdk-js/1.0.0 KiroIDE-${kiroVersion}-${machineId}`,
             'user-agent': `aws-sdk-js/1.0.0 ua/2.1 os/${osName} lang/js md/nodejs#${nodeVersion} api/codewhispererruntime#1.0.0 m/E KiroIDE-${kiroVersion}-${machineId}`,
             'amz-sdk-invocation-id': uuidv4(),
-            'amz-sdk-request': 'attempt=1; max=1',
-            'Connection': 'close'
+            'amz-sdk-request': 'attempt=1; max=1'
         };
 
         try {
