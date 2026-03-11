@@ -596,14 +596,10 @@ async loadCredentials() {
         this.idcRegion = this.idcRegion || mergedCredentials.idcRegion;
 
         if (!this.region) {
-            // region 缺失时，优先使用 idcRegion（Builder ID 场景常见）
-            if (this.idcRegion) {
-                logger.info(`[Kiro Auth] Region not found, using idcRegion: ${this.idcRegion}`);
-                this.region = this.idcRegion;
-            } else {
-                logger.warn('[Kiro Auth] Region not found in credentials. Using default region us-east-1 for URLs.');
-                this.region = 'us-east-1';
-            }
+            // Kiro API endpoint (q.*.amazonaws.com) 只存在于 us-east-1
+            // idcRegion 是 AWS SSO 的区域，不能用于 API endpoint
+            logger.info('[Kiro Auth] Region not found in credentials. Using default region us-east-1 for API URLs.');
+            this.region = 'us-east-1';
         }
 
         // idcRegion 用于 REFRESH_IDC_URL，如果未设置则使用 region
