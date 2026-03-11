@@ -3063,6 +3063,7 @@ async saveCredentialsToFile(filePath, newData) {
         };
 
         try {
+            logger.info(`[Kiro] getUsageLimits URL: ${fullUrl}`);
             const response = await this.axiosInstance.get(fullUrl, { headers });
             logger.info('[Kiro] Usage limits fetched successfully');
             return response.data;
@@ -3096,6 +3097,7 @@ async saveCredentialsToFile(filePath, newData) {
             }
             
             if (status === 403) {
+                logger.info(`[Kiro] Received 403 on getUsageLimits. Response body: ${JSON.stringify(error.response?.data)}`);
                 logger.info('[Kiro] Received 403 on getUsageLimits. Marking credential as unhealthy (no retry)...');
                 
                 // 检查是否为 temporarily suspended 错误
