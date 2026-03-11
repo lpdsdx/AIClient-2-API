@@ -713,6 +713,7 @@ async saveCredentialsToFile(filePath, newData) {
                 this.accessToken = response.data.accessToken;
                 this.refreshToken = response.data.refreshToken;
                 this.profileArn = response.data.profileArn;
+                logger.info(`[Kiro Auth] Token refresh returned profileArn: ${this.profileArn ? 'yes (' + this.profileArn.substring(0, 30) + '...)' : 'no'}`);
                 const expiresIn = response.data.expiresIn;
                 const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString();
                 this.expiresAt = expiresAt;
@@ -1387,7 +1388,8 @@ async saveCredentialsToFile(filePath, newData) {
 
         request.conversationState.currentMessage.userInputMessage = userInputMessage;
 
-        if (this.authMethod === KIRO_CONSTANTS.AUTH_METHOD_SOCIAL) {
+        // profileArn 对所有认证方式都需要（social 和 builder-id）
+        if (this.profileArn) {
             request.profileArn = this.profileArn;
         }
 
@@ -1548,6 +1550,9 @@ async saveCredentialsToFile(filePath, newData) {
 
             // 当 model 以 kiro-amazonq 开头时，使用 amazonQUrl，否则使用 baseUrl
             const requestUrl = model.startsWith('amazonq') ? this.amazonQUrl : this.baseUrl;
+            logger.info(`[Kiro Debug] callApi -> POST ${requestUrl}`);
+            logger.info(`[Kiro Debug] callApi headers: ${JSON.stringify({ ...headers, Authorization: 'Bearer ***' })}`);
+            logger.info(`[Kiro Debug] axiosInstance defaults UA: ${this.axiosInstance.defaults.headers?.['user-agent']?.substring(0, 80)}...`);
             const response = await this.axiosInstance.post(requestUrl, requestData, { headers });
             return response;
         } catch (error) {
@@ -1584,6 +1589,9 @@ async saveCredentialsToFile(filePath, newData) {
 
             // Handle 403 (Forbidden) - mark as unhealthy immediately, no retry
             if (status === 403 && !isRetry) {
+                const responseBody = error.response?.data;
+                logger.info(`[Kiro Debug] 403 response body: ${JSON.stringify(responseBody)}`);
+                logger.info(`[Kiro Debug] 403 response headers: ${JSON.stringify(error.response?.headers)}`);
                 logger.info('[Kiro] Received 403. Marking credential as need refresh...');
                 
                 // 检查是否为 temporarily suspended 错误
