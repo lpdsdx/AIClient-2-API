@@ -3044,7 +3044,8 @@ async saveCredentialsToFile(filePath, newData) {
             origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR,
             resourceType: resourceType
         });
-         if (this.authMethod === KIRO_CONSTANTS.AUTH_METHOD_SOCIAL && this.profileArn) {
+        // profileArn 对所有认证方式都需要（social 和 builder-id）
+        if (this.profileArn) {
             params.append('profileArn', this.profileArn);
         }
         const fullUrl = `${usageLimitsUrl}?${params.toString()}`;
@@ -3098,20 +3099,19 @@ async saveCredentialsToFile(filePath, newData) {
             
             if (status === 403) {
                 logger.info(`[Kiro] Received 403 on getUsageLimits. Response body: ${JSON.stringify(error.response?.data)}`);
-                logger.info('[Kiro] Received 403 on getUsageLimits. Marking credential as unhealthy (no retry)...');
-                
+
                 // 检查是否为 temporarily suspended 错误
-                const isSuspended = errorMessage && errorMessage.toLowerCase().includes('temporarily is suspended');
-                
+                const isSuspended = errorMessage?.toLowerCase().includes('temporarily is suspended');
+
                 if (isSuspended) {
-                    // temporarily suspended 错误：直接标记为不健康，不刷新 UUID
-                    logger.info('[Kiro] Account temporarily suspended on usage query. Marking as unhealthy without UUID refresh...');
+                    logger.info('[Kiro] Account temporarily suspended on usage query. Marking as unhealthy...');
                     this._markCredentialUnhealthy('403 Forbidden - Account temporarily suspended on usage query', formattedError);
                 } else {
-                    // 其他 403 错误：标记需要刷新
-                    this._markCredentialNeedRefresh('403 Forbidden on usage query', formattedError);
+                    // 非 suspended 的 403（如 Builder ID 权限不足）不标记凭证不健康
+                    // 用量查询是 UI 展示功能，不应影响正常对话请求
+                    logger.warn('[Kiro] getUsageLimits returned 403 (not suspended). Credential health unchanged.');
                 }
-                
+
                 throw formattedError;
             }
             
